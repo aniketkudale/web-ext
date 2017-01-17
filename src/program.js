@@ -18,6 +18,17 @@ type ProgramOptions = {|
   absolutePackageDir?: string,
 |}
 
+// TODO: add pipes to Flow type after https://github.com/facebook/flow/issues/2405 is fixed
+
+type ExecuteOptions = {
+  checkForUpdates?: Function,
+  systemProcess?: typeof process,
+  logStream?: typeof defaultLogStream,
+  getVersion?: Function,
+  shouldExitProgram?: boolean,
+  globalEnv?: string,
+}
+
 /*
  * The command line program.
  */
@@ -59,7 +70,11 @@ export class Program {
         return;
       }
       return yargs
-        .demand(0, 0, 'This command does not take any arguments')
+        // Make sure the user does not add any extra commands. For example,
+        // this would be a mistake because lint does not accept arguments:
+        // web-ext lint ./src/path/to/file.js
+        .demandCommand(0, 0, undefined,
+                       'This command does not take any arguments')
         .strict()
         .exitProcess(this.shouldExitProgram)
         // Calling env() will be unnecessary after
@@ -93,7 +108,7 @@ export class Program {
       checkForUpdates = defaultUpdateChecker, systemProcess = process,
       logStream = defaultLogStream, getVersion = defaultVersionGetter,
       shouldExitProgram = true, globalEnv = WEBEXT_BUILD_ENV,
-    }: Object = {}
+    }: ExecuteOptions = {}
   ): Promise<void> {
 
     this.shouldExitProgram = shouldExitProgram;
@@ -170,13 +185,21 @@ export function defaultVersionGetter(
   }
 }
 
+// TODO: add pipes to Flow type after https://github.com/facebook/flow/issues/2405 is fixed
+
+type MainParams = {
+  getVersion?: Function,
+  commands?: Object,
+  argv: Array<any>,
+  runOptions?: Object,
+}
 
 export function main(
   absolutePackageDir: string,
   {
     getVersion = defaultVersionGetter, commands = defaultCommands, argv,
     runOptions = {},
-  }: Object = {}
+  }: MainParams = {}
 ): Promise<any> {
 
   const program = new Program(argv, {absolutePackageDir});
@@ -198,7 +221,7 @@ Example: $0 --help run.
     .alias('h', 'help')
     .env(envPrefix)
     .version(() => getVersion(absolutePackageDir))
-    .demand(1)
+    .demandCommand(1, 'You must specify a command')
     .strict();
 
   program.setGlobalOptions({
@@ -315,6 +338,13 @@ Example: $0 --help run.
         requiresArg: true,
         type: 'string',
         coerce: coerceCLICustomPreference,
+      },
+      'start-url': {
+        alias: ['u', 'url'],
+        describe: 'Launch firefox at specified page',
+        demand: false,
+        requiresArg: true,
+        type: 'string',
       },
       'browser-console': {
         alias: ['bc'],

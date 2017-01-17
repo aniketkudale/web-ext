@@ -2,6 +2,9 @@
 import type FirefoxProfile from 'firefox-profile';
 import type Watchpack from 'watchpack';
 
+import {
+  showDesktopNotification as defaultDesktopNotifications,
+} from '../util/desktop-notifier';
 import * as defaultFirefoxApp from '../firefox';
 import defaultFirefoxConnector from '../firefox/remote';
 import {
@@ -28,13 +31,15 @@ const log = createLogger(__filename);
 
 // defaultWatcherCreator types and implementation.
 
-export type WatcherCreatorParams = {
+export type WatcherCreatorParams = {|
   addonId: string,
   client: RemoteFirefox,
   sourceDir: string,
   artifactsDir: string,
   onSourceChange?: OnSourceChangeFn,
-};
+  desktopNotifications?: typeof defaultDesktopNotifications,
+|};
+
 
 export type WatcherCreatorFn = (params: WatcherCreatorParams) => Watchpack;
 
@@ -42,6 +47,7 @@ export function defaultWatcherCreator(
   {
     addonId, client, sourceDir, artifactsDir,
     onSourceChange = defaultSourceWatcher,
+    desktopNotifications = defaultDesktopNotifications,
   }: WatcherCreatorParams
  ): Watchpack {
   return onSourceChange({
@@ -49,10 +55,15 @@ export function defaultWatcherCreator(
     artifactsDir,
     onChange: () => {
       log.debug(`Reloading add-on ID ${addonId}`);
+
       return client.reloadAddon(addonId)
         .catch((error) => {
           log.error('\n');
           log.error(error.stack);
+          desktopNotifications({
+            title: 'web-ext run: error occured',
+            message: error.message,
+          });
           throw error;
         });
     },
@@ -62,18 +73,18 @@ export function defaultWatcherCreator(
 
 // defaultReloadStrategy types and implementation.
 
-export type ReloadStrategyParams = {
+export type ReloadStrategyParams = {|
   addonId: string,
   firefoxProcess: FirefoxProcess,
   client: RemoteFirefox,
   profile: FirefoxProfile,
   sourceDir: string,
   artifactsDir: string,
-};
+|};
 
-export type ReloadStrategyOptions = {
+export type ReloadStrategyOptions = {|
   createWatcher?: WatcherCreatorFn,
-};
+|};
 
 export function defaultReloadStrategy(
   {
@@ -97,11 +108,11 @@ export function defaultReloadStrategy(
 
 // defaultFirefoxClient types and implementation.
 
-export type CreateFirefoxClientParams = {
+export type CreateFirefoxClientParams = {|
   connectToFirefox?: FirefoxConnectorFn,
   maxRetries: number,
   retryInterval: number,
-};
+|};
 
 export function defaultFirefoxClient(
   {
@@ -144,7 +155,7 @@ export function defaultFirefoxClient(
 
 // Run command types and implementation.
 
-export type CmdRunParams = {
+export type CmdRunParams = {|
   sourceDir: string,
   artifactsDir: string,
   firefox: string,
@@ -153,19 +164,20 @@ export type CmdRunParams = {
   noReload: boolean,
   browserConsole: boolean,
   customPrefs?: FirefoxPreferences,
-};
+  startUrl?: string | Array<string>,
+|};
 
-export type CmdRunOptions = {
+export type CmdRunOptions = {|
   firefoxApp: typeof defaultFirefoxApp,
   firefoxClient: typeof defaultFirefoxClient,
   reloadStrategy: typeof defaultReloadStrategy,
-};
+|};
 
 export default async function run(
   {
     sourceDir, artifactsDir, firefox, firefoxProfile,
     preInstall = false, noReload = false,
-    browserConsole = false, customPrefs,
+    browserConsole = false, customPrefs, startUrl,
   }: CmdRunParams,
   {
     firefoxApp = defaultFirefoxApp,
@@ -197,6 +209,7 @@ export default async function run(
     manifestData,
     profilePath: firefoxProfile,
     customPrefs,
+    startUrl,
   });
 
   const profile = await runner.getProfile();
@@ -261,7 +274,7 @@ export default async function run(
 
 // ExtensionRunner types and implementation.
 
-export type ExtensionRunnerParams = {
+export type ExtensionRunnerParams = {|
   sourceDir: string,
   manifestData: ExtensionManifest,
   profilePath: string,
@@ -269,7 +282,8 @@ export type ExtensionRunnerParams = {
   firefox: string,
   browserConsole: boolean,
   customPrefs?: FirefoxPreferences,
-};
+  startUrl?: string | Array<string>,
+|};
 
 export class ExtensionRunner {
   sourceDir: string;
@@ -279,11 +293,12 @@ export class ExtensionRunner {
   firefox: string;
   browserConsole: boolean;
   customPrefs: FirefoxPreferences;
+  startUrl: ?string | ?Array<string>;
 
   constructor(
     {
       firefoxApp, sourceDir, manifestData,
-      profilePath, firefox, browserConsole,
+      profilePath, firefox, browserConsole, startUrl,
       customPrefs = {},
     }: ExtensionRunnerParams
   ) {
@@ -294,6 +309,7 @@ export class ExtensionRunner {
     this.firefox = firefox;
     this.browserConsole = browserConsole;
     this.customPrefs = customPrefs;
+    this.startUrl = startUrl;
   }
 
   getProfile(): Promise<FirefoxProfile> {
@@ -329,12 +345,18 @@ export class ExtensionRunner {
 
   run(profile: FirefoxProfile): Promise<FirefoxProcess> {
     const binaryArgs = [];
-    const {firefoxApp, firefox} = this;
+    const {firefoxApp, firefox, startUrl} = this;
     if (this.browserConsole) {
       binaryArgs.push('-jsconsole');
     }
-    return firefoxApp.run(
-      profile, {firefoxBinary: firefox, binaryArgs}
-    );
+    if (startUrl) {
+      const urls = Array.isArray(startUrl) ? startUrl : [startUrl];
+      for (const url of urls) {
+        binaryArgs.push('--url', url);
+      }
+    }
+    return firefoxApp.run(profile, {
+      firefoxBinary: firefox, binaryArgs,
+    });
   }
 }
