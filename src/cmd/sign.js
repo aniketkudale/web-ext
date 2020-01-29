@@ -15,26 +15,31 @@ import type {ExtensionManifest} from '../util/manifest';
 
 const log = createLogger(__filename);
 
+const defaultAsyncFsReadFile = fs.readFile.bind(fs);
+
 export const extensionIdFile = '.web-extension-id';
 
 // Sign command types and implementation.
 
 export type SignParams = {|
-  id?: string,
-  verbose?: boolean,
-  sourceDir: string,
-  artifactsDir: string,
   apiKey: string,
+  apiProxy: string,
   apiSecret: string,
   apiUrlPrefix: string,
-  apiProxy: string,
+  artifactsDir: string,
+  id?: string,
+  ignoreFiles?: Array<string>,
+  sourceDir: string,
   timeout: number,
+  verbose?: boolean,
+  channel?: string,
 |};
 
 export type SignOptions = {
   build?: typeof defaultBuilder,
   signAddon?: typeof defaultAddonSigner,
   preValidatedManifest?: ExtensionManifest,
+  shouldExitProgram?: boolean,
 };
 
 export type SignResult = {|
@@ -45,12 +50,22 @@ export type SignResult = {|
 
 export default function sign(
   {
-    verbose, sourceDir, artifactsDir, apiKey, apiSecret,
-    apiUrlPrefix, apiProxy, id, timeout,
+    apiKey,
+    apiProxy,
+    apiSecret,
+    apiUrlPrefix,
+    artifactsDir,
+    id,
+    ignoreFiles = [],
+    sourceDir,
+    timeout,
+    verbose,
+    channel,
   }: SignParams,
   {
-    build = defaultBuilder, signAddon = defaultAddonSigner,
+    build = defaultBuilder,
     preValidatedManifest,
+    signAddon = defaultAddonSigner,
   }: SignOptions = {}
 ): Promise<SignResult> {
   return withTempDir(
@@ -66,7 +81,7 @@ export default function sign(
       }
 
       const [buildResult, idFromSourceDir] = await Promise.all([
-        build({sourceDir, artifactsDir: tmpDir.path()},
+        build({sourceDir, ignoreFiles, artifactsDir: tmpDir.path()},
               {manifestData, showReadyMessage: false}),
         getIdFromSourceDir(sourceDir),
       ]);
@@ -107,6 +122,7 @@ export default function sign(
         xpiPath: buildResult.extensionPath,
         version: manifestData.version,
         downloadDir: artifactsDir,
+        channel,
       });
 
       if (signingResult.id) {
@@ -121,7 +137,7 @@ export default function sign(
       } else {
         log.info('FAIL');
         throw new WebExtError(
-          'The WebExtension could not be signed');
+          'The extension could not be signed');
       }
 
       return signingResult;
@@ -131,14 +147,15 @@ export default function sign(
 
 
 export async function getIdFromSourceDir(
-  sourceDir: string
+  sourceDir: string,
+  asyncFsReadFile: typeof defaultAsyncFsReadFile = defaultAsyncFsReadFile,
 ): Promise<string | void> {
   const filePath = path.join(sourceDir, extensionIdFile);
 
   let content;
 
   try {
-    content = await fs.readFile(filePath);
+    content = await asyncFsReadFile(filePath);
   } catch (error) {
     if (isErrorWithCode('ENOENT', error)) {
       log.debug(`No ID file found at: ${filePath}`);

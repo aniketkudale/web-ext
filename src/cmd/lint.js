@@ -2,8 +2,11 @@
 import {createInstance as defaultLinterCreator} from 'addons-linter';
 
 import {createLogger} from '../util/logger';
-import {FileFilter} from './build';
-
+import {
+  createFileFilter as defaultFileFilterCreator,
+} from '../util/file-filter';
+// import flow types
+import type {FileFilterCreatorFn} from '../util/file-filter';
 
 const log = createLogger(__filename);
 
@@ -38,31 +41,45 @@ export type LinterCreatorFn = (params: LinterCreatorParams) => Linter;
 // Lint command types and implementation.
 
 export type LintCmdParams = {|
+  artifactsDir?: string,
+  boring?: boolean,
+  ignoreFiles?: Array<string>,
+  metadata?: boolean,
+  output?: LinterOutputType,
+  pretty?: boolean,
+  selfHosted?: boolean,
   sourceDir: string,
   verbose?: boolean,
-  selfHosted?: boolean,
-  boring?: boolean,
-  output?: LinterOutputType,
-  metadata?: boolean,
-  pretty?: boolean,
   warningsAsErrors?: boolean,
 |};
 
 export type LintCmdOptions = {|
   createLinter?: LinterCreatorFn,
-  fileFilter?: FileFilter,
+  createFileFilter?: FileFilterCreatorFn,
+  shouldExitProgram?: boolean,
 |};
 
 export default function lint(
   {
-    verbose, sourceDir, selfHosted, boring, output,
-    metadata, pretty, warningsAsErrors,
+    artifactsDir,
+    boring,
+    ignoreFiles,
+    metadata,
+    output,
+    pretty,
+    sourceDir,
+    selfHosted,
+    verbose,
+    warningsAsErrors,
   }: LintCmdParams,
   {
     createLinter = defaultLinterCreator,
-    fileFilter = new FileFilter(),
+    createFileFilter = defaultFileFilterCreator,
+    shouldExitProgram = true,
   }: LintCmdOptions = {}
 ): Promise<void> {
+  const fileFilter = createFileFilter({sourceDir, ignoreFiles, artifactsDir});
+
   log.debug(`Running addons-linter on ${sourceDir}`);
   const linter = createLinter({
     config: {
@@ -79,7 +96,7 @@ export default function lint(
       // which should be the directory to the extension.
       _: [sourceDir],
     },
-    runAsBinary: true,
+    runAsBinary: shouldExitProgram,
   });
   return linter.run();
 }

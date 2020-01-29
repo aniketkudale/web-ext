@@ -1,34 +1,40 @@
 /*eslint prefer-template: 0*/
 var path = require('path');
-var fs = require('fs');
 
 var webpack = require('webpack');
 
 var nodeModules = {};
 
-// This is to filter out node_modules as we don't want them
-// to be made part of any bundles.
-fs.readdirSync('node_modules')
-  .filter(function(x) {
-    return ['.bin'].indexOf(x) === -1;
-  })
+// Do not bundle any external module, because those are explicitly added as
+// "dependencies" in package.json. Bundling them anyway could result in bugs
+// like https://github.com/mozilla/web-ext/issues/1629
+Object.keys(require('./package.json').dependencies)
   .forEach(function(mod) {
     nodeModules[mod] = 'commonjs ' + mod;
   });
 
-var preLoaders = [];
-
-if (process.env.COVERAGE === 'y') {
-  preLoaders.push([
-    {
-      test: /\.js$/,
-      exclude: /(node_modules|bower_components|test)/,
-      loader: 'babel-istanbul',
-    },
-  ]);
+// Allow use of importing parts of an external module, without bundling them.
+function nodeModulesExternalsHandler(context, request, callback) {
+  var mod = request.split('/', 1)[0];
+  if (Object.prototype.hasOwnProperty.call(nodeModules, mod)) {
+    callback(null, 'commonjs ' + request);
+    return;
+  }
+  callback();
 }
 
+var rules = [
+  {
+    exclude: /(node_modules|bower_components)/,
+    test: /\.js$/,
+    // babel options are in .babelrc
+    loaders: ['babel-loader'],
+  },
+];
+
 module.exports = {
+  mode: process.env.NODE_ENV && process.env.NODE_ENV !== 'test' ?
+    process.env.NODE_ENV : 'development',
   entry: './src/main.js',
   target: 'node',
   node: {
@@ -41,20 +47,18 @@ module.exports = {
     libraryTarget: 'commonjs2',
   },
   module: {
-    preLoaders,
-    loaders: [
-      {
-        exclude: /(node_modules|bower_components)/,
-        test: /\.js$/,
-        // babel options are in .babelrc
-        loaders: ['babel'],
-      },
-    ],
+    rules,
   },
-  externals: nodeModules,
+  externals: [
+    nodeModules,
+    nodeModulesExternalsHandler,
+  ],
   plugins: [
-    new webpack.BannerPlugin('require("source-map-support").install();',
-                             { raw: true, entryOnly: false }),
+    new webpack.BannerPlugin({
+      banner: 'require("source-map-support").install();',
+      raw: true,
+      entryOnly: false,
+    }),
     // This seems necessary to work with the 'when' module, which is
     // required by some things such as fx-runner.
     new webpack.IgnorePlugin(/vertx/),
@@ -65,10 +69,10 @@ module.exports = {
     }),
   ],
   resolve: {
-    extensions: ['', '.js', '.json'],
-    modulesDirectories: [
-      'src',
-      'node_modules',
+    extensions: ['.js', '.json'],
+    modules: [
+      path.join(__dirname, 'src'),
+      path.resolve(__dirname, 'node_modules'),
     ],
   },
   devtool: 'sourcemap',

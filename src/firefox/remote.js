@@ -1,20 +1,19 @@
 /* @flow */
-import defaultFirefoxConnector from 'node-firefox-connect';
+import net from 'net';
+
+import defaultFirefoxConnector from '@cliqz-oss/node-firefox-connect';
 // RemoteFirefox types and implementation
-import type FirefoxClient from 'firefox-client'; //eslint-disable-line import/no-extraneous-dependencies
+import type FirefoxClient from '@cliqz-oss/firefox-client';
 
 import {createLogger} from '../util/logger';
 import {
+  isErrorWithCode,
   RemoteTempInstallNotSupported,
   UsageError,
   WebExtError,
 } from '../errors';
 
 const log = createLogger(__filename);
-
-// The default port that Firefox's remote debugger will listen on and the
-// client will connect to.
-export const REMOTE_PORT = 6005;
 
 export type FirefoxConnectorFn =
   (port?: number) => Promise<FirefoxClient>;
@@ -76,9 +75,10 @@ export class RemoteFirefox {
       this.client.client.makeRequest(
         {to: addon.actor, type: request}, (response) => {
           if (response.error) {
-            reject(
-              new WebExtError(`${request} response error: ` +
-                              `${response.error}: ${response.message}`));
+            const error = `${response.error}: ${response.message}`;
+            log.debug(
+              `Client responded to '${request}' request with error:`, error);
+            reject(new WebExtError(error));
           } else {
             resolve(response);
           }
@@ -90,31 +90,36 @@ export class RemoteFirefox {
     addonPath: string
   ): Promise<FirefoxRDPResponseAddon> {
     return new Promise((resolve, reject) => {
-      this.client.request('listTabs', (error, response) => {
+      this.client.request('listTabs', (error, tabsResponse) => {
         if (error) {
           return reject(new WebExtError(
             `Remote Firefox: listTabs() error: ${error}`));
         }
-        if (!response.addonsActor) {
+        if (!tabsResponse.addonsActor) {
           log.debug(
-            `listTabs returned a falsey addonsActor: ${response.addonsActor}`);
+            'listTabs returned a falsey addonsActor: ' +
+            `${tabsResponse.addonsActor}`);
           return reject(new RemoteTempInstallNotSupported(
             'This is an older version of Firefox that does not provide an ' +
             'add-ons actor for remote installation. Try Firefox 49 or ' +
             'higher.'));
         }
-        this.client.client.makeRequest(
-          {to: response.addonsActor, type: 'installTemporaryAddon', addonPath},
-          (response) => {
-            if (response.error) {
-              return reject(new WebExtError(
-                'installTemporaryAddon: Error: ' +
-                `${response.error}: ${response.message}`));
-            }
-            log.debug(`installTemporaryAddon: ${JSON.stringify(response)}`);
-            log.info(`Installed ${addonPath} as a temporary add-on`);
-            resolve(response);
-          });
+
+        this.client.client.makeRequest({
+          to: tabsResponse.addonsActor,
+          type: 'installTemporaryAddon',
+          addonPath,
+        }, (installResponse) => {
+          if (installResponse.error) {
+            return reject(new WebExtError(
+              'installTemporaryAddon: Error: ' +
+              `${installResponse.error}: ${installResponse.message}`));
+          }
+          log.debug(
+            `installTemporaryAddon: ${JSON.stringify(installResponse)}`);
+          log.info(`Installed ${addonPath} as a temporary add-on`);
+          resolve(installResponse);
+        });
       });
     });
   }
@@ -184,19 +189,72 @@ export type ConnectOptions = {|
   connectToFirefox: FirefoxConnectorFn,
 |};
 
-// NOTE: this fixes an issue with flow and default exports (which currently
-// lose their type signatures) by explicitly declaring the default export
-// signature. Reference: https://github.com/facebook/flow/issues/449
-declare function exports(
-  port: number, options?: ConnectOptions
-): Promise<RemoteFirefox>;
-
-export default async function connect(
-  port: number = REMOTE_PORT,
+export async function connect(
+  port: number,
   {connectToFirefox = defaultFirefoxConnector}: ConnectOptions = {}
 ): Promise<RemoteFirefox> {
   log.debug(`Connecting to Firefox on port ${port}`);
   const client = await connectToFirefox(port);
-  log.debug('Connected to the remote Firefox debugger');
+  log.debug(`Connected to the remote Firefox debugger on port ${port}`);
   return new RemoteFirefox(client);
+}
+
+
+// ConnectWithMaxRetries types and implementation
+
+export type ConnectWithMaxRetriesParams = {|
+  maxRetries?: number,
+  retryInterval?: number,
+  port: number,
+|};
+
+export type ConnectWithMaxRetriesDeps = {|
+  connectToFirefox: typeof connect,
+|};
+
+export async function connectWithMaxRetries(
+  // A max of 250 will try connecting for 30 seconds.
+  {maxRetries = 250, retryInterval = 120, port}: ConnectWithMaxRetriesParams,
+  {connectToFirefox = connect}: ConnectWithMaxRetriesDeps = {}
+): Promise<RemoteFirefox> {
+  async function establishConnection() {
+    var lastError;
+
+    for (let retries = 0; retries <= maxRetries; retries++) {
+      try {
+        return await connectToFirefox(port);
+      } catch (error) {
+        if (isErrorWithCode('ECONNREFUSED', error)) {
+          // Wait for `retryInterval` ms.
+          await new Promise((resolve) => {
+            setTimeout(resolve, retryInterval);
+          });
+
+          lastError = error;
+          log.debug(
+            `Retrying Firefox (${retries}); connection error: ${error}`);
+        } else {
+          log.error(error.stack);
+          throw error;
+        }
+      }
+    }
+
+    log.debug('Connect to Firefox debugger: too many retries');
+    throw lastError;
+  }
+
+  log.debug('Connecting to the remote Firefox debugger');
+  return establishConnection();
+}
+
+export function findFreeTcpPort(): Promise<number> {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    // $FLOW_FIXME: flow has his own opinions on this method signature.
+    srv.listen(0, () => {
+      const freeTcpPort = srv.address().port;
+      srv.close(() => resolve(freeTcpPort));
+    });
+  });
 }

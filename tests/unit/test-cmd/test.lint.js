@@ -4,17 +4,15 @@ import {assert} from 'chai';
 import sinon from 'sinon';
 
 import defaultLintCommand from '../../../src/cmd/lint';
-import {FileFilter} from '../../../src/cmd/build';
-import {fake, makeSureItFails} from '../helpers';
 
 type setUpParams = {|
   createLinter?: Function,
-  fileFilter?: Function,
+  createFileFilter?: Function,
 |}
 
 describe('lint', () => {
 
-  function setUp({createLinter, fileFilter}: setUpParams = {}) {
+  function setUp({createLinter, createFileFilter}: setUpParams = {}) {
     const lintResult = '<lint.run() result placeholder>';
     const runLinter = sinon.spy(() => Promise.resolve(lintResult));
     if (!createLinter) {
@@ -26,9 +24,15 @@ describe('lint', () => {
       lintResult,
       createLinter,
       runLinter,
-      lint: ({...args}) => {
-        // $FLOW_IGNORE: type checks skipped for testing purpose
-        return defaultLintCommand(args, {createLinter, fileFilter});
+      lint: (params = {}, options = {}) => {
+        return defaultLintCommand({
+          sourceDir: '/fake/source/dir',
+          ...params,
+        }, {
+          createLinter,
+          createFileFilter,
+          ...options,
+        });
       },
     };
   }
@@ -37,28 +41,33 @@ describe('lint', () => {
     const {lint, createLinter, runLinter, lintResult} = setUp();
     return lint().then((actualLintResult) => {
       assert.equal(actualLintResult, lintResult);
-      assert.equal(createLinter.called, true);
-      assert.equal(runLinter.called, true);
+      sinon.assert.called(createLinter);
+      sinon.assert.called(runLinter);
     });
   });
 
-  it('fails when the linter fails', () => {
+  it('fails when the linter fails', async () => {
     const createLinter = () => {
       return {
         run: () => Promise.reject(new Error('some error from the linter')),
       };
     };
     const {lint} = setUp({createLinter});
-    return lint().then(makeSureItFails(), (error) => {
-      assert.match(error.message, /error from the linter/);
-    });
+
+    await assert.isRejected(lint(), /error from the linter/);
   });
 
   it('runs as a binary', () => {
     const {lint, createLinter} = setUp();
     return lint().then(() => {
-      const args = createLinter.firstCall.args[0];
-      assert.equal(args.runAsBinary, true);
+      sinon.assert.calledWithMatch(createLinter, {runAsBinary: true});
+    });
+  });
+
+  it('sets runAsBinary according shouldExitProgram option', () => {
+    const {lint, createLinter} = setUp();
+    return lint({}, {shouldExitProgram: false}).then(() => {
+      sinon.assert.calledWithMatch(createLinter, {runAsBinary: false});
     });
   });
 
@@ -73,74 +82,87 @@ describe('lint', () => {
   it('passes warningsAsErrors to the linter', () => {
     const {lint, createLinter} = setUp();
     return lint({warningsAsErrors: true}).then(() => {
-      const config = createLinter.firstCall.args[0].config;
-      assert.equal(config.warningsAsErrors, true);
+      sinon.assert.calledWithMatch(createLinter, {
+        config: {
+          warningsAsErrors: true,
+        },
+      });
     });
   });
 
   it('passes warningsAsErrors undefined to the linter', () => {
     const {lint, createLinter} = setUp();
-    return lint({}).then(() => {
-      const config = createLinter.firstCall.args[0].config;
-      assert.equal(config.warningsAsErrors, undefined);
+    return lint().then(() => {
+      sinon.assert.calledWithMatch(createLinter, {
+        config: {
+          warningsAsErrors: undefined,
+        },
+      });
     });
   });
 
   it('configures the linter when verbose', () => {
     const {lint, createLinter} = setUp();
     return lint({verbose: true}).then(() => {
-      const config = createLinter.firstCall.args[0].config;
-      assert.equal(config.logLevel, 'debug');
-      assert.equal(config.stack, true);
+      sinon.assert.calledWithMatch(createLinter, {
+        config: {
+          logLevel: 'debug',
+          stack: true,
+        },
+      });
     });
   });
 
   it('configures the linter when not verbose', () => {
     const {lint, createLinter} = setUp();
     return lint({verbose: false}).then(() => {
-      const config = createLinter.firstCall.args[0].config;
-      assert.equal(config.logLevel, 'fatal');
-      assert.equal(config.stack, false);
+      sinon.assert.calledWithMatch(createLinter, {
+        config: {
+          logLevel: 'fatal',
+          stack: false,
+        },
+      });
     });
   });
 
   it('passes through linter configuration', () => {
     const {lint, createLinter} = setUp();
     return lint({
-      // $FLOW_IGNORE: wrong type used for testing purpose
-      pretty: 'pretty flag',
-      // $FLOW_IGNORE: wrong type used for testing purpose
-      metadata: 'metadata flag',
-      // $FLOW_IGNORE: wrong type used for testing purpose
-      output: 'output value',
-      // $FLOW_IGNORE: wrong type used for testing purpose
-      boring: 'boring flag',
-      // $FLOW_IGNORE: wrong type used for testing purpose
-      selfHosted: 'self-hosted flag',
+      pretty: true,
+      metadata: true,
+      output: 'json',
+      boring: true,
+      selfHosted: true,
     }).then(() => {
-      const config = createLinter.firstCall.args[0].config;
-      assert.equal(config.pretty, 'pretty flag');
-      assert.equal(config.metadata, 'metadata flag');
-      assert.equal(config.output, 'output value');
-      assert.equal(config.boring, 'boring flag');
-      assert.equal(config.selfHosted, 'self-hosted flag');
+      sinon.assert.calledWithMatch(createLinter, {
+        config: {
+          pretty: true,
+          metadata: true,
+          output: 'json',
+          boring: true,
+          selfHosted: true,
+        },
+      });
     });
   });
 
-  it('passes a file filter to the linter', () => {
-    const fileFilter = fake(new FileFilter());
-    const {lint, createLinter} = setUp({fileFilter});
-    return lint()
-      .then(() => {
-        assert.equal(createLinter.called, true);
-        const config = createLinter.firstCall.args[0].config;
-        assert.isFunction(config.shouldScanFile);
+  it('configures a lint command with the expected fileFilter', () => {
+    const fileFilter = {wantFile: sinon.spy(() => true)};
+    const createFileFilter = sinon.spy(() => fileFilter);
+    const {lint, createLinter} = setUp({createFileFilter});
+    const params = {
+      sourceDir: '.',
+      artifactsDir: 'artifacts',
+      ignoreFiles: ['file1', '**/file2'],
+    };
+    return lint(params).then(() => {
+      sinon.assert.calledWith(createFileFilter, params);
 
-        // Simulate how the linter will use this callback.
-        config.shouldScanFile('manifest.json');
-        assert.equal(fileFilter.wantFile.called, true);
-        assert.equal(fileFilter.wantFile.firstCall.args[0], 'manifest.json');
-      });
+      assert.ok(createLinter.called);
+      const {shouldScanFile} = createLinter.firstCall.args[0].config;
+      shouldScanFile('path/to/file');
+      sinon.assert.calledWith(fileFilter.wantFile, 'path/to/file');
+    });
   });
 
 });

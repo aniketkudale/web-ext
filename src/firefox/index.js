@@ -1,22 +1,21 @@
 /* @flow */
 import nodeFs from 'fs';
 import path from 'path';
+import {promisify} from 'util';
 
 import {default as defaultFxRunner} from 'fx-runner';
 import FirefoxProfile, {copyFromUserProfile as defaultUserProfileCopier}
   from 'firefox-profile';
-import streamToPromise from 'stream-to-promise';
 import {fs} from 'mz';
-import promisify from 'es6-promisify';
+import eventToPromise from 'event-to-promise';
 
 import isDirectory from '../util/is-directory';
 import {isErrorWithCode, UsageError, WebExtError} from '../errors';
 import {getPrefs as defaultPrefGetter} from './preferences';
 import {getManifestId} from '../util/manifest';
+import {findFreeTcpPort as defaultRemotePortFinder} from './remote';
 import {createLogger} from '../util/logger';
-import {default as defaultFirefoxConnector, REMOTE_PORT} from './remote';
 // Import flow types
-import type {FirefoxConnectorFn} from './remote';
 import type {
   PreferencesAppName,
   PreferencesGetterFn,
@@ -27,6 +26,8 @@ import type {ExtensionManifest} from '../util/manifest';
 
 const log = createLogger(__filename);
 
+const defaultAsyncFsStat = fs.stat.bind(fs);
+
 export const defaultFirefoxEnv = {
   XPCOM_DEBUG_BREAK: 'stack',
   NS_TRACE_MALLOC_DISABLE_STACKS: '1',
@@ -34,48 +35,9 @@ export const defaultFirefoxEnv = {
 
 // defaultRemotePortFinder types and implementation.
 
-export type RemotePortFinderParams = {|
-  portToTry?: number,
-  retriesLeft?: number,
-  connectToFirefox?: FirefoxConnectorFn,
-|};
 
 export type RemotePortFinderFn =
-  (params?: RemotePortFinderParams) => Promise<number>;
-
-export async function defaultRemotePortFinder(
-  {
-    portToTry = REMOTE_PORT,
-    retriesLeft = 10,
-    connectToFirefox = defaultFirefoxConnector,
-  }: RemotePortFinderParams = {}
-): Promise<number> {
-  log.debug(`Checking if remote Firefox port ${portToTry} is available`);
-
-  let client;
-
-  while (retriesLeft >= 0) {
-    try {
-      client = await connectToFirefox(portToTry);
-      log.debug(`Remote Firefox port ${portToTry} is in use ` +
-                `(retries remaining: ${retriesLeft})`);
-    } catch (error) {
-      if (isErrorWithCode('ECONNREFUSED', error)) {
-        // The connection was refused so this port is good to use.
-        return portToTry;
-      }
-
-      throw error;
-    }
-
-    client.disconnect();
-    portToTry++;
-    retriesLeft--;
-  }
-
-  throw new WebExtError('Too many retries on port search');
-}
-
+  () => Promise<number>;
 
 // Declare the needed 'fx-runner' module flow types.
 
@@ -96,6 +58,7 @@ export type FirefoxRunnerParams = {|
 export interface FirefoxProcess extends events$EventEmitter {
   stderr: events$EventEmitter;
   stdout: events$EventEmitter;
+  kill: Function;
 }
 
 export type FirefoxRunnerResults = {|
@@ -107,6 +70,11 @@ export type FirefoxRunnerResults = {|
 export type FirefoxRunnerFn =
   (params: FirefoxRunnerParams) => Promise<FirefoxRunnerResults>;
 
+
+export type FirefoxInfo = {|
+  firefox: FirefoxProcess,
+  debuggerPort: number,
+|}
 
 // Run command types and implementaion.
 
@@ -128,9 +96,9 @@ export async function run(
     findRemotePort = defaultRemotePortFinder,
     firefoxBinary, binaryArgs,
   }: FirefoxRunOptions = {}
-): Promise<FirefoxProcess> {
+): Promise<FirefoxInfo> {
 
-  log.info(`Running Firefox with profile at ${profile.path()}`);
+  log.debug(`Running Firefox with profile at ${profile.path()}`);
 
   const remotePort = await findRemotePort();
 
@@ -179,9 +147,93 @@ export async function run(
     log.debug('Firefox closed');
   });
 
-  return firefox;
+  return { firefox, debuggerPort: remotePort };
 }
 
+
+// isDefaultProfile types and implementation.
+
+const DEFAULT_PROFILES_NAMES = [
+  'default',
+  'dev-edition-default',
+];
+
+export type IsDefaultProfileFn = (
+  profilePathOrName: string,
+  ProfileFinder?: typeof FirefoxProfile.Finder,
+  fsStat?: typeof fs.stat,
+) => Promise<boolean>;
+
+/*
+ * Tests if a profile is a default Firefox profile (both as a profile name or
+ * profile path).
+ *
+ * Returns a promise that resolves to true if the profile is one of default Firefox profile.
+ */
+export async function isDefaultProfile(
+  profilePathOrName: string,
+  ProfileFinder?: typeof FirefoxProfile.Finder = FirefoxProfile.Finder,
+  fsStat?: typeof fs.stat = fs.stat,
+): Promise<boolean> {
+  if (DEFAULT_PROFILES_NAMES.includes(profilePathOrName)) {
+    return true;
+  }
+
+  const baseProfileDir = ProfileFinder.locateUserDirectory();
+  const profilesIniPath = path.join(baseProfileDir, 'profiles.ini');
+  try {
+    await fsStat(profilesIniPath);
+  } catch (error) {
+    if (isErrorWithCode('ENOENT', error)) {
+      log.debug(`profiles.ini not found: ${error}`);
+
+      // No profiles exist yet, default to false (the default profile name contains a
+      // random generated component).
+      return false;
+    }
+
+    // Re-throw any unexpected exception.
+    throw error;
+  }
+
+  // Check for profile dir path.
+  const finder = new ProfileFinder(baseProfileDir);
+  const readProfiles = promisify(finder.readProfiles.bind(finder));
+
+  await readProfiles();
+
+  const normalizedProfileDirPath = path.normalize(
+    path.join(path.resolve(profilePathOrName), path.sep)
+  );
+
+  for (const profile of finder.profiles) {
+    // Check if the profile dir path or name is one of the default profiles
+    // defined in the profiles.ini file.
+    if (DEFAULT_PROFILES_NAMES.includes(profile.Name) ||
+        profile.Default === '1') {
+      let profileFullPath;
+
+      // Check for profile name.
+      if (profile.Name === profilePathOrName) {
+        return true;
+      }
+
+      // Check for profile path.
+      if (profile.IsRelative === '1') {
+        profileFullPath = path.join(baseProfileDir, profile.Path, path.sep);
+      } else {
+        profileFullPath = path.join(profile.Path, path.sep);
+      }
+
+      if (path.normalize(profileFullPath) === normalizedProfileDirPath) {
+        return true;
+      }
+    }
+  }
+
+  // Profile directory not found.
+  return false;
+}
 
 // configureProfile types and implementation.
 
@@ -225,6 +277,93 @@ export function configureProfile(
   }
   profile.updatePreferences();
   return Promise.resolve(profile);
+}
+
+export type getProfileFn = (profileName: string) => Promise<string | void>;
+
+export type CreateProfileFinderParams = {|
+  userDirectoryPath?: string,
+  FxProfile?: typeof FirefoxProfile
+|}
+
+export function defaultCreateProfileFinder(
+  {
+    userDirectoryPath,
+    FxProfile = FirefoxProfile,
+  }: CreateProfileFinderParams = {}
+): getProfileFn {
+  const finder = new FxProfile.Finder(userDirectoryPath);
+  const readProfiles = promisify(finder.readProfiles.bind(finder));
+  const getPath = promisify(finder.getPath.bind(finder));
+  return async (profileName: string): Promise<string | void> => {
+    try {
+      await readProfiles();
+      const hasProfileName = finder.profiles.filter(
+        (profileDef) => profileDef.Name === profileName).length !== 0;
+      if (hasProfileName) {
+        return await getPath(profileName);
+      }
+    } catch (error) {
+      if (!isErrorWithCode('ENOENT', error)) {
+        throw error;
+      }
+      log.warn('Unable to find Firefox profiles.ini');
+    }
+  };
+}
+
+// useProfile types and implementation.
+
+export type UseProfileParams = {
+  app?: PreferencesAppName,
+  configureThisProfile?: ConfigureProfileFn,
+  isFirefoxDefaultProfile?: IsDefaultProfileFn,
+  customPrefs?: FirefoxPreferences,
+  createProfileFinder?: typeof defaultCreateProfileFinder,
+};
+
+// Use the target path as a Firefox profile without cloning it
+
+export async function useProfile(
+  profilePath: string,
+  {
+    app,
+    configureThisProfile = configureProfile,
+    isFirefoxDefaultProfile = isDefaultProfile,
+    customPrefs = {},
+    createProfileFinder = defaultCreateProfileFinder,
+  }: UseProfileParams = {},
+): Promise<FirefoxProfile> {
+  const isForbiddenProfile = await isFirefoxDefaultProfile(profilePath);
+  if (isForbiddenProfile) {
+    throw new UsageError(
+      'Cannot use --keep-profile-changes on a default profile' +
+      ` ("${profilePath}")` +
+      ' because web-ext will make it insecure and unsuitable for daily use.' +
+      '\nSee https://github.com/mozilla/web-ext/issues/1005'
+    );
+  }
+
+  let destinationDirectory;
+  const getProfilePath = createProfileFinder();
+
+  const profileIsDirPath = await isDirectory(profilePath);
+  if (profileIsDirPath) {
+    log.debug(`Using profile directory "${profilePath}"`);
+    destinationDirectory = profilePath;
+  } else {
+    log.debug(`Assuming ${profilePath} is a named profile`);
+    destinationDirectory = await getProfilePath(profilePath);
+    if (!destinationDirectory) {
+      throw new UsageError(
+        `The request "${profilePath}" profile name ` +
+        'cannot be resolved to a profile path'
+      );
+    }
+  }
+
+  const profile = new FirefoxProfile({destinationDirectory});
+  return await configureThisProfile(profile, {app, customPrefs});
 }
 
 
@@ -315,6 +454,7 @@ export type InstallExtensionParams = {|
   manifestData: ExtensionManifest,
   profile: FirefoxProfile,
   extensionPath: string,
+  asyncFsStat?: typeof defaultAsyncFsStat,
 |};
 
 /*
@@ -334,6 +474,7 @@ export async function installExtension(
     manifestData,
     profile,
     extensionPath,
+    asyncFsStat = defaultAsyncFsStat,
   }: InstallExtensionParams): Promise<any> {
   // This more or less follows
   // https://github.com/saadtazi/firefox-profile-js/blob/master/lib/firefox_profile.js#L531
@@ -345,7 +486,7 @@ export async function installExtension(
   }
 
   try {
-    await fs.stat(profile.extensionsDir);
+    await asyncFsStat(profile.extensionsDir);
   } catch (error) {
     if (isErrorWithCode('ENOENT', error)) {
       log.debug(`Creating extensions directory: ${profile.extensionsDir}`);
@@ -379,7 +520,7 @@ export async function installExtension(
     const writeStream = nodeFs.createWriteStream(destPath);
     writeStream.write(extensionPath);
     writeStream.end();
-    await streamToPromise(writeStream);
+    return await eventToPromise(writeStream, 'close');
   } else {
     // Write the XPI file to the profile.
     const readStream = nodeFs.createReadStream(extensionPath);
@@ -390,8 +531,8 @@ export async function installExtension(
     readStream.pipe(writeStream);
 
     return await Promise.all([
-      streamToPromise(readStream),
-      streamToPromise(writeStream),
+      eventToPromise(readStream, 'close'),
+      eventToPromise(writeStream, 'close'),
     ]);
   }
 }

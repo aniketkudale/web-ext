@@ -1,12 +1,18 @@
 /* @flow */
 import path from 'path';
+import EventEmitter from 'events';
+import tty from 'tty';
+import stream from 'stream';
+import {promisify} from 'util';
 
+import deepcopy from 'deepcopy';
 import sinon from 'sinon';
 import yauzl from 'yauzl';
 import ExtendableError from 'es6-error';
-import promisify from 'es6-promisify';
 
 import {createLogger} from '../../src/util/logger';
+import * as defaultFirefoxApp from '../../src/firefox';
+import {RemoteFirefox} from '../../src/firefox/remote';
 
 const log = createLogger(__filename);
 
@@ -16,9 +22,11 @@ const log = createLogger(__filename);
  */
 export class ZipFile {
   _zip: any;
+  _close: Promise<void> | null;
 
   constructor() {
     this._zip = null;
+    this._close = null;
   }
 
   /*
@@ -29,7 +37,18 @@ export class ZipFile {
     return promisify(yauzl.open)(...args)
       .then((zip) => {
         this._zip = zip;
+        this._close = new Promise((resolve) => {
+          zip.once('close', resolve);
+        });
       });
+  }
+
+  /**
+   * Close the zip file and wait fd to release.
+   */
+  close() {
+    this._zip.close();
+    return this._close;
   }
 
   /*
@@ -94,9 +113,8 @@ export function fixturePath(...pathParts: Array<string>): string {
  *
  * Usage:
  *
- *  Promise.resolve()
- *    .then(makeSureItFails())
- *    .catch((error) => {
+ *  Promise.reject(new Error('some error'))
+ *    .then(makeSureItFails(), (error) => {
  *      // Safely make assertions about the error...
  *    });
  */
@@ -135,23 +153,20 @@ export function makeSureItFails(): Function {
  * assert.equal(fakeProcess.exit.called, true);
  *
  */
- // $FLOW_IGNORE: fake can return any kind of object and fake a defined set of methods for testing.
-export function fake<T>(original: Object, methods: Object = {}): T {
-  var stub = {};
+
+// $FLOW_IGNORE: fake can return any kind of object and fake a defined set of methods for testing.
+export function fake<T>(
+  original: Object, methods: Object = {}, skipProperties: Array<string> = []
+): T {
+  const stub = {};
 
   // Provide stubs for all original members:
-  var props = [];
-  var obj = original;
-  while (obj) {
-    props = props.concat(Object.getOwnPropertyNames(obj));
-    obj = Object.getPrototypeOf(obj);
-  }
+  const proto = Object.getPrototypeOf(original);
+  const props = Object.getOwnPropertyNames(original)
+    .concat(Object.getOwnPropertyNames(proto))
+    .filter((key) => !skipProperties.includes(key));
 
-  var proto = Object.getPrototypeOf(original);
   for (const key of props) {
-    if (!original.hasOwnProperty(key) && !proto.hasOwnProperty(key)) {
-      continue;
-    }
     const definition = original[key] || proto[key];
     if (typeof definition === 'function') {
       stub[key] = () => {
@@ -174,9 +189,19 @@ export function fake<T>(original: Object, methods: Object = {}): T {
     stub[key] = sinon.spy(stub[key]);
   });
 
+  // $FLOW_IGNORE: fake can return any kind of object for testing.
   return stub;
 }
 
+export function createFakeProcess() {
+  return fake(process, {}, ['EventEmitter', 'stdin']);
+}
+
+export class StubChildProcess extends EventEmitter {
+  stderr = new EventEmitter();
+  stdout = new EventEmitter();
+  kill = sinon.spy(() => {});
+}
 
 /*
  * Returns a fake Firefox client as would be returned by
@@ -192,7 +217,7 @@ type FakeFirefoxClientParams = {|
 export function fakeFirefoxClient({
   requestResult = {}, requestError,
   makeRequestResult = {}, makeRequestError,
-}: FakeFirefoxClientParams= {}) {
+}: FakeFirefoxClientParams = {}) {
   return {
     disconnect: sinon.spy(() => {}),
     request: sinon.spy(
@@ -238,4 +263,92 @@ export class TCPConnectError extends ExtendableError {
     super(msg);
     this.code = 'ECONNREFUSED';
   }
+}
+
+export class ErrorWithCode extends Error {
+  code: string;
+  constructor(code: ?string, message: ?string) {
+    super(`${code || ''}: ${message || 'pretend this is a system error'}`);
+    this.code = code || 'SOME_CODE';
+  }
+}
+
+/*
+ * A basic manifest fixture used in unit tests.
+ */
+export const basicManifest = {
+  name: 'the extension',
+  version: '0.0.1',
+  applications: {
+    gecko: {
+      id: 'basic-manifest@web-ext-test-suite',
+    },
+  },
+};
+
+/*
+ * A basic manifest fixture without an applications property.
+ */
+export const manifestWithoutApps = deepcopy(basicManifest);
+delete manifestWithoutApps.applications;
+
+/*
+ * A class that implements an empty IExtensionRunner interface.
+ */
+export class FakeExtensionRunner {
+  params: any;
+
+  constructor(params: any) {
+    this.params = params;
+  }
+
+  getName() {
+    return 'Fake Extension Runner';
+  }
+
+  async run() {}
+  async exit() {}
+  async reloadAllExtensions() {
+    return [];
+  }
+  async reloadExtensionBySourceDir(sourceDir: string) {
+    const runnerName = this.getName();
+    return [{runnerName, sourceDir}];
+  }
+  registerCleanup(fn: Function) {} // eslint-disable-line no-unused-vars
+}
+
+export function getFakeFirefox(
+  implementations: Object = {}, port: number = 6005
+) {
+  const profile = {}; // empty object just to avoid errors.
+  const firefox = () => Promise.resolve();
+  const allImplementations = {
+    createProfile: () => Promise.resolve(profile),
+    copyProfile: () => Promise.resolve(profile),
+    useProfile: () => Promise.resolve(profile),
+    installExtension: () => Promise.resolve(),
+    run: () => Promise.resolve({firefox, debuggerPort: port}),
+    ...implementations,
+  };
+  return fake(defaultFirefoxApp, allImplementations);
+}
+
+export function getFakeRemoteFirefox(implementations: Object = {}) {
+  return fake(RemoteFirefox.prototype, implementations);
+}
+
+class FakeStdin extends stream.Readable {
+  get isTTY() {
+    return true;
+  }
+
+  // Fake tty.ReadStream methods.
+  setRawMode() {}
+  _read() {}
+}
+
+export function createFakeStdin(): tty.ReadStream {
+  // $FLOW_IGNORE: flow complains that the return value is incompatible with tty.ReadStream
+  return new FakeStdin();
 }

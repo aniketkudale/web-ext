@@ -5,18 +5,22 @@ import {fs} from 'mz';
 import {it, describe} from 'mocha';
 import {assert} from 'chai';
 import sinon from 'sinon';
+import defaultEventToPromise from 'event-to-promise';
 
 import build, {
   safeFileName,
-  FileFilter,
   getDefaultLocalizedName,
+  defaultPackageCreator,
 } from '../../../src/cmd/build';
+import {FileFilter} from '../../../src/util/file-filter';
 import {withTempDir} from '../../../src/util/temp-dir';
-import {fixturePath, makeSureItFails, ZipFile} from '../helpers';
 import {
   basicManifest,
+  fixturePath,
+  makeSureItFails,
   manifestWithoutApps,
-} from '../test-util/test.manifest';
+  ZipFile,
+} from '../helpers';
 import {UsageError} from '../../../src/errors';
 import {createLogger} from '../../../src/util/logger';
 
@@ -44,8 +48,28 @@ describe('build', () => {
             fileNames.sort();
             assert.deepEqual(fileNames,
                              ['background-script.js', 'manifest.json']);
+            return zipFile.close();
           })
     );
+  });
+
+  it('configures a build command with the expected fileFilter', () => {
+    const packageCreator = sinon.spy(
+      () => ({extensionPath: 'extension/path'})
+    );
+    const fileFilter = {wantFile: () => true};
+    const createFileFilter = sinon.spy(() => fileFilter);
+    const params = {
+      sourceDir: '/src',
+      artifactsDir: 'artifacts',
+      ignoreFiles: ['**/*.log'],
+    };
+    return build(params, {packageCreator, createFileFilter}).then(() => {
+      // ensure sourceDir, artifactsDir, ignoreFiles is used
+      sinon.assert.calledWithMatch(createFileFilter, params);
+      // ensure packageCreator received correct fileFilter
+      sinon.assert.calledWithMatch(packageCreator, {fileFilter});
+    });
   });
 
   it('gives the correct name to a localized extension', () => {
@@ -58,7 +82,20 @@ describe('build', () => {
           .then((buildResult) => {
             assert.match(buildResult.extensionPath,
                          /name_of_the_extension-1\.0\.zip$/);
-            return buildResult.extensionPath;
+          })
+    );
+  });
+
+  it('accept a dash in the default_locale field', () => {
+    return withTempDir(
+      (tmpDir) =>
+        build({
+          sourceDir: fixturePath('dashed-locale'),
+          artifactsDir: tmpDir.path(),
+        })
+          .then((buildResult) => {
+            assert.match(buildResult.extensionPath,
+                         /extension_with_dashed_locale-1\.0\.zip$/);
           })
     );
   });
@@ -67,12 +104,14 @@ describe('build', () => {
     return withTempDir(
       (tmpDir) => {
         const messageFileName = path.join(tmpDir.path(), 'messages.json');
-        fs.writeFileSync(messageFileName,
+        fs.writeFileSync(
+          messageFileName,
           `{"extensionName": {
               "message": "example extension",
               "description": "example description"
             }
-          }`);
+          }`
+        );
 
         const manifestWithRepeatingPattern = {
           name: '__MSG_extensionName__ __MSG_extensionName__',
@@ -90,12 +129,58 @@ describe('build', () => {
     );
   });
 
+  it('handles UTF-8 BOM in messages.json', () => withTempDir(
+    async (tmpDir) => {
+      const manifestDataWithBOM = '\uFEFF{"name":{"message":"BOM = \uFEFF!"}}';
+      const messageFileName = path.join(tmpDir.path(), 'messages.json');
+      await fs.writeFile(messageFileName, manifestDataWithBOM);
+      const result = await getDefaultLocalizedName({
+        messageFile: messageFileName,
+        manifestData: {
+          name: '__MSG_name__',
+          version: '0.0.1',
+        },
+      });
+      assert.equal(result, 'BOM = \uFEFF!');
+    }
+  ));
+
+  it('handles comments in messages.json', () => {
+    return withTempDir(
+      (tmpDir) => {
+        const messageFileName = path.join(tmpDir.path(), 'messages.json');
+        fs.writeFileSync(
+          messageFileName,
+          `{"extensionName": {
+              "message": "example extension", // comments
+              "description": "example with comments"
+            }
+          }`
+        );
+
+        return getDefaultLocalizedName({
+          messageFile: messageFileName,
+          manifestData: {
+            name: '__MSG_extensionName__',
+            version: '0.0.1',
+          },
+        })
+          .then((result) => {
+            assert.match(result, /example extension/);
+          });
+      }
+    );
+  });
+
   it('checks locale file for malformed json', () => {
     return withTempDir(
       (tmpDir) => {
         const messageFileName = path.join(tmpDir.path(), 'messages.json');
-        fs.writeFileSync(messageFileName,
-          '{"simulated:" "json syntax error"');
+        fs.writeFileSync(
+          messageFileName,
+          '{"simulated:" "json syntax error"'
+        );
+
         return getDefaultLocalizedName({
           messageFile: messageFileName,
           manifestData: manifestWithoutApps,
@@ -103,8 +188,9 @@ describe('build', () => {
           .then(makeSureItFails())
           .catch((error) => {
             assert.instanceOf(error, UsageError);
-            assert.match(error.message, /Unexpected token '"' at 1:15/);
-            assert.match(error.message, /^Error parsing messages.json/);
+            assert.match(
+              error.message, /Unexpected string in JSON at position 14/);
+            assert.match(error.message, /^Error parsing messages\.json/);
             assert.include(error.message, messageFileName);
           });
       }
@@ -116,11 +202,14 @@ describe('build', () => {
       (tmpDir) => {
         const messageFileName = path.join(tmpDir.path(), 'messages.json');
         //This is missing the 'message' key
-        fs.writeFileSync(messageFileName,
+        fs.writeFileSync(
+          messageFileName,
           `{"extensionName": {
               "description": "example extension"
               }
-          }`);
+          }`
+        );
+
         const basicLocalizedManifest = {
           name: '__MSG_extensionName__',
           version: '0.0.1',
@@ -154,7 +243,7 @@ describe('build', () => {
           /Error: ENOENT: no such file or directory, open .*messages.json/);
         assert.match(error.message, /^Error reading messages.json/);
         assert.include(error.message,
-          '/path/to/non-existent-dir/messages.json');
+                       '/path/to/non-existent-dir/messages.json');
       });
   });
 
@@ -202,7 +291,8 @@ describe('build', () => {
   it('asks FileFilter what files to include in the ZIP', () => {
     const zipFile = new ZipFile();
     const fileFilter = new FileFilter({
-      filesToIgnore: ['**/background-script.js'],
+      sourceDir: '.',
+      baseIgnoredPatterns: ['**/background-script.js'],
     });
 
     return withTempDir(
@@ -215,17 +305,18 @@ describe('build', () => {
           .then(() => zipFile.extractFilenames())
           .then((fileNames) => {
             assert.notInclude(fileNames, 'background-script.js');
+            return zipFile.close();
           })
     );
   });
 
   it('lets you rebuild when files change', () => withTempDir(
     (tmpDir) => {
-      const fileFilter = new FileFilter();
-      sinon.spy(fileFilter, 'wantFile');
-      const onSourceChange = sinon.spy(() => {});
       const sourceDir = fixturePath('minimal-web-ext');
       const artifactsDir = tmpDir.path();
+      const fileFilter = new FileFilter({sourceDir, artifactsDir});
+      sinon.spy(fileFilter, 'wantFile');
+      const onSourceChange = sinon.spy(() => {});
       return build({
         sourceDir, artifactsDir, asNeeded: true,
       }, {
@@ -237,16 +328,20 @@ describe('build', () => {
           return buildResult;
         })
         .then((buildResult) => {
-          assert.equal(onSourceChange.called, true);
           const args = onSourceChange.firstCall.args[0];
-          assert.equal(args.sourceDir, sourceDir);
-          assert.equal(args.artifactsDir, artifactsDir);
+
+          sinon.assert.called(onSourceChange);
+          sinon.assert.calledWithMatch(onSourceChange, {
+            artifactsDir,
+            sourceDir,
+          });
+
           assert.typeOf(args.onChange, 'function');
 
           // Make sure it uses the file filter.
           assert.typeOf(args.shouldWatchFile, 'function');
           args.shouldWatchFile('/some/path');
-          assert.equal(fileFilter.wantFile.called, true);
+          sinon.assert.called(fileFilter.wantFile);
 
           // Remove the built extension.
           return fs.unlink(buildResult.extensionPath)
@@ -278,9 +373,8 @@ describe('build', () => {
         manifestData: basicManifest, onSourceChange, packageCreator,
       })
         .then(() => {
-          assert.equal(onSourceChange.called, true);
-          assert.equal(packageCreator.callCount, 1);
-
+          sinon.assert.called(onSourceChange);
+          sinon.assert.calledOnce(packageCreator);
           const {onChange} = onSourceChange.firstCall.args[0];
           packageResult = Promise.reject(new Error(
             'Simulate an error on the second call to packageCreator()'));
@@ -296,6 +390,78 @@ describe('build', () => {
     }
   ));
 
+  it('raises an UsageError if zip file exists', () => {
+    return withTempDir(
+      (tmpDir) => {
+        const testFileName = path.join(tmpDir.path(),
+                                       'minimal_extension-1.0.zip');
+        return fs.writeFile(testFileName, 'test')
+          .then(() => build(
+            {
+              sourceDir: fixturePath('minimal-web-ext'),
+              artifactsDir: tmpDir.path(),
+            }))
+          .catch ((error) => {
+            assert.instanceOf(error, UsageError);
+            assert.match(error.message,
+                         /Extension exists at the destination path/);
+          });
+      });
+  });
+
+  it('overwrites zip file if it exists', () => {
+    return withTempDir(
+      (tmpDir) => {
+        const testFileName = path.join(tmpDir.path(),
+                                       'minimal_extension-1.0.zip');
+        return fs.writeFile(testFileName, 'test')
+          .then(() => build(
+            {
+              sourceDir: fixturePath('minimal-web-ext'),
+              artifactsDir: tmpDir.path(),
+              overwriteDest: true,
+            }))
+          .then((buildResult) => {
+            assert.match(buildResult.extensionPath,
+                         /minimal_extension-1\.0\.zip$/);
+          });
+      });
+  });
+
+  it('zips a package and includes a file from a negated filter', () => {
+    const zipFile = new ZipFile();
+
+    return withTempDir(
+      (tmpDir) =>
+        build({
+          sourceDir: fixturePath('minimal-web-ext'),
+          artifactsDir: tmpDir.path(),
+          ignoreFiles: [
+            '!node_modules',
+            '!node_modules/pkg1',
+            '!node_modules/pkg1/**',
+          ],
+        })
+          .then((buildResult) => {
+            assert.match(buildResult.extensionPath,
+                         /minimal_extension-1\.0\.zip$/);
+            return buildResult.extensionPath;
+          })
+          .then((extensionPath) => zipFile.open(extensionPath))
+          .then(() => zipFile.extractFilenames())
+          .then((fileNames) => {
+            fileNames.sort();
+            assert.deepEqual(fileNames, [
+              'background-script.js', 'manifest.json',
+              'node_modules/',
+              'node_modules/pkg1/',
+              'node_modules/pkg1/file1.txt',
+            ]);
+            return zipFile.close();
+          })
+    );
+  });
+
   describe('safeFileName', () => {
 
     it('makes names safe for writing to a file system', () => {
@@ -305,47 +471,40 @@ describe('build', () => {
 
   });
 
-  describe('FileFilter', () => {
-    const defaultFilter = new FileFilter();
+  describe('defaultPackageCreator', () => {
+    it('should reject on Unexpected errors', () => {
+      return withTempDir(
+        (tmpDir) => {
+          const fakeEventToPromise = sinon.spy(async (stream) => {
+            await defaultEventToPromise(stream, 'close');
+            // Remove contents of tmpDir before removal of directory.
+            const files = await fs.readdir(tmpDir.path());
+            for (const file of files) {
+              await fs.unlink(path.join(tmpDir.path(), file));
+            }
+            return Promise.reject(new Error('Unexpected error'));
+          });
+          const sourceDir = fixturePath('minimal-web-ext');
+          const artifactsDir = tmpDir.path();
+          const fileFilter = new FileFilter({sourceDir, artifactsDir});
+          const params = {
+            manifestData: basicManifest,
+            sourceDir,
+            fileFilter,
+            artifactsDir,
+            overwriteDest: false,
+            showReadyMessage: false,
+          };
+          const options = {
+            eventToPromise: fakeEventToPromise,
+          };
 
-    it('ignores long XPI paths by default', () => {
-      assert.equal(defaultFilter.wantFile('path/to/some.xpi'), false);
-    });
-
-    it('ignores short XPI paths by default', () => {
-      assert.equal(defaultFilter.wantFile('some.xpi'), false);
-    });
-
-    it('ignores .git directories by default', () => {
-      assert.equal(defaultFilter.wantFile('.git'), false);
-    });
-
-    it('ignores nested .git directories by default', () => {
-      assert.equal(defaultFilter.wantFile('path/to/.git'), false);
-    });
-
-    it('ignores any hidden file by default', () => {
-      assert.equal(defaultFilter.wantFile('.whatever'), false);
-    });
-
-    it('ignores ZPI paths by default', () => {
-      assert.equal(defaultFilter.wantFile('path/to/some.zip'), false);
-    });
-
-    it('allows other files', () => {
-      assert.equal(defaultFilter.wantFile('manifest.json'), true);
-    });
-
-    it('allows you to override the defaults', () => {
-      const filter = new FileFilter({
-        filesToIgnore: ['manifest.json'],
-      });
-      assert.equal(filter.wantFile('some.xpi'), true);
-      assert.equal(filter.wantFile('manifest.json'), false);
-    });
-
-    it('ignores node_modules by default', () => {
-      assert.equal(defaultFilter.wantFile('path/to/node_modules'), false);
+          return defaultPackageCreator(params, options)
+            .then(makeSureItFails())
+            .catch ((error) => {
+              assert.match(error.message, /Unexpected error/);
+            });
+        });
     });
 
   });

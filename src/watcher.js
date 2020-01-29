@@ -1,9 +1,10 @@
 /* @flow */
+import {fs} from 'mz';
 import Watchpack from 'watchpack';
 import debounce from 'debounce';
 
+import { UsageError } from './errors';
 import {createLogger} from './util/logger';
-import {FileFilter} from './cmd/build';
 
 
 const log = createLogger(__filename);
@@ -17,20 +18,28 @@ export type OnChangeFn = () => any;
 
 export type OnSourceChangeParams = {|
   sourceDir: string,
+  watchFile?: string,
   artifactsDir: string,
   onChange: OnChangeFn,
-  shouldWatchFile?: ShouldWatchFn,
+  shouldWatchFile: ShouldWatchFn,
 |};
 
 // NOTE: this fix an issue with flow and default exports (which currently
 // lose their type signatures) by explicitly declare the default export
 // signature. Reference: https://github.com/facebook/flow/issues/449
+// eslint-disable-next-line no-shadow
 declare function exports(params: OnSourceChangeParams): Watchpack;
 
 export type OnSourceChangeFn = (params: OnSourceChangeParams) => Watchpack;
 
 export default function onSourceChange(
-  {sourceDir, artifactsDir, onChange, shouldWatchFile}: OnSourceChangeParams
+  {
+    sourceDir,
+    watchFile,
+    artifactsDir,
+    onChange,
+    shouldWatchFile,
+  }: OnSourceChangeParams
 ): Watchpack {
   // TODO: For network disks, we would need to add {poll: true}.
   const watcher = new Watchpack();
@@ -42,8 +51,23 @@ export default function onSourceChange(
     proxyFileChanges({artifactsDir, onChange, filePath, shouldWatchFile});
   });
 
-  log.debug(`Watching for file changes in ${sourceDir}`);
-  watcher.watch([], [sourceDir], Date.now());
+  log.debug(`Watching for file changes in ${watchFile || sourceDir}`);
+
+  const watchedDirs = [];
+  const watchedFiles = [];
+
+  if (watchFile) {
+    if (fs.existsSync(watchFile) && !fs.lstatSync(watchFile).isFile()) {
+      throw new UsageError('Invalid --watch-file value: ' +
+        `"${watchFile}" is not a file.`);
+    }
+
+    watchedFiles.push(watchFile);
+  } else {
+    watchedDirs.push(sourceDir);
+  }
+
+  watcher.watch(watchedFiles, watchedDirs, Date.now());
 
   // TODO: support interrupting the watcher on Windows.
   // https://github.com/mozilla/web-ext/issues/225
@@ -58,16 +82,12 @@ export type ProxyFileChangesParams = {|
   artifactsDir: string,
   onChange: OnChangeFn,
   filePath: string,
-  shouldWatchFile?: ShouldWatchFn,
+  shouldWatchFile: ShouldWatchFn,
 |};
 
 export function proxyFileChanges(
   {artifactsDir, onChange, filePath, shouldWatchFile}: ProxyFileChangesParams
 ): void {
-  if (!shouldWatchFile) {
-    const fileFilter = new FileFilter();
-    shouldWatchFile = (...args) => fileFilter.wantFile(...args);
-  }
   if (filePath.indexOf(artifactsDir) === 0 || !shouldWatchFile(filePath)) {
     log.debug(`Ignoring change to: ${filePath}`);
   } else {

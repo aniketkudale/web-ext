@@ -9,21 +9,11 @@ import {fs} from 'mz';
 import {onlyInstancesOf, InvalidManifest} from '../../../src/errors';
 import getValidatedManifest, {getManifestId} from '../../../src/util/manifest';
 import {withTempDir} from '../../../src/util/temp-dir';
-import {makeSureItFails} from '../helpers';
-
-
-export const basicManifest = {
-  name: 'the extension',
-  version: '0.0.1',
-  applications: {
-    gecko: {
-      id: 'basic-manifest@web-ext-test-suite',
-    },
-  },
-};
-
-export const manifestWithoutApps = deepcopy(basicManifest);
-delete manifestWithoutApps.applications;
+import {
+  basicManifest,
+  makeSureItFails,
+  manifestWithoutApps,
+} from '../helpers';
 
 
 describe('util/manifest', () => {
@@ -49,7 +39,7 @@ describe('util/manifest', () => {
     ));
 
     it('reports an error for a missing manifest file', () => {
-      const nonExistentDir = '/dev/null/nowhere/';
+      const nonExistentDir = path.join('dev', 'null', 'nowhere');
       return getValidatedManifest(nonExistentDir)
         .then(makeSureItFails())
         .catch(onlyInstancesOf(InvalidManifest, (error) => {
@@ -63,7 +53,7 @@ describe('util/manifest', () => {
     it('reports an error for invalid manifest JSON', () => withTempDir(
       (tmpDir) => {
         const badManifest = `{
-          "name": "I'm an invalid JSON Manifest
+          "name": "I'm an invalid JSON Manifest",,
           "version": "0.0.0"
         }`;
         const manifestFile = path.join(tmpDir.path(), 'manifest.json');
@@ -71,8 +61,14 @@ describe('util/manifest', () => {
           .then(() => getValidatedManifest(tmpDir.path()))
           .then(makeSureItFails())
           .catch(onlyInstancesOf(InvalidManifest, (error) => {
-            assert.match(error.message, /Error parsing manifest\.json at /);
-            assert.include(error.message, 'Unexpected token \' \' at 2:49');
+            assert.match(
+              error.message,
+              /Error parsing manifest\.json file at /
+            );
+            assert.include(
+              error.message,
+              'Unexpected token , in JSON at position 51'
+            );
             assert.include(error.message, manifestFile);
           }));
       }
@@ -166,6 +162,51 @@ describe('util/manifest', () => {
           });
       }
     ));
+
+    it('ignore UTF-8 BOM in manifest JSON', () => withTempDir(
+      async (tmpDir) => {
+        const manifestDataWithBOM = `\uFEFF${JSON.stringify(basicManifest)}`;
+        const manifestFile = path.join(tmpDir.path(), 'manifest.json');
+        await fs.writeFile(manifestFile, manifestDataWithBOM);
+        const manifestData = await getValidatedManifest(tmpDir.path());
+
+        assert.deepEqual(manifestData, basicManifest);
+      }
+    ));
+
+    it('allows comments in manifest JSON', () =>
+      withTempDir(async (tmpDir) => {
+        const manifestWithComments = `{
+          "name": "the extension",
+          "version": "0.0.1" // comments
+        }`;
+        const manifestFile = path.join(tmpDir.path(), 'manifest.json');
+        await fs.writeFile(manifestFile, manifestWithComments);
+        const manifestData = await getValidatedManifest(tmpDir.path());
+
+        assert.deepEqual(manifestData, manifestWithoutApps);
+      })
+    );
+
+    it('reports an error with line number in manifest JSON with comments', () =>
+      withTempDir(async (tmpDir) => {
+        const invalidManifestWithComments = `{
+          // a comment in its own line
+          // another comment on its own line
+          "name": "I'm an invalid JSON Manifest
+        }`;
+        const manifestFile = path.join(tmpDir.path(), 'manifest.json');
+        await fs.writeFile(manifestFile, invalidManifestWithComments);
+        const promise = getValidatedManifest(tmpDir.path());
+
+        const error = await assert.isRejected(promise, InvalidManifest);
+        await assert.isRejected(
+          promise,
+          /Error parsing manifest\.json file at .* in JSON at position 133/
+        );
+        assert.include(error.message, manifestFile);
+      })
+    );
 
   });
 

@@ -22,14 +22,13 @@ export type PreferencesAppName = 'firefox' | 'fennec';
 const prefsCommon: FirefoxPreferences = {
   // Allow debug output via dump to be printed to the system console
   'browser.dom.window.dump.enabled': true,
-  // Warn about possibly incorrect code.
-  'javascript.options.strict': true,
-  'javascript.options.showInConsole': true,
 
   // Allow remote connections to the debugger.
   'devtools.debugger.remote-enabled': true,
   // Disable the prompt for allowing connections.
   'devtools.debugger.prompt-connection': false,
+  // Allow extensions to log messages on browser's console.
+  'devtools.browserconsole.contentMessages': true,
 
   // Turn off platform logging because it is a lot of info.
   'extensions.logging.enabled': false,
@@ -54,23 +53,20 @@ const prefsCommon: FirefoxPreferences = {
   // Disable app update.
   'app.update.enabled': false,
 
-  // Point update checks to a nonexistent local URL for fast failures.
-  'extensions.update.url': 'http://localhost/extensions-dummy/updateURL',
-  'extensions.blocklist.url':
-    'http://localhost/extensions-dummy/blocklistURL',
-
-  // Make sure opening about:addons won't hit the network.
-  'extensions.webservice.discoverURL':
-    'http://localhost/extensions-dummy/discoveryURL',
-
   // Allow unsigned add-ons.
   'xpinstall.signatures.required': false,
+
+  // browser.link.open_newwindow is changed from 3 to 2 in:
+  // https://github.com/saadtazi/firefox-profile-js/blob/cafc793d940a779d280103ae17d02a92de862efc/lib/firefox_profile.js#L32
+  // Restore original value to avoid https://github.com/mozilla/web-ext/issues/1592
+  'browser.link.open_newwindow': 3,
 };
 
 // Prefs specific to Firefox for Android.
 const prefsFennec: FirefoxPreferences = {
   'browser.console.showInPanel': true,
   'browser.firstrun.show.uidiscovery': false,
+  'devtools.remote.usb.enabled': true,
 };
 
 // Prefs specific to Firefox for desktop.
@@ -97,6 +93,11 @@ const prefsFirefox: FirefoxPreferences = {
   'browser.selfsupport.url': 'https://localhost/selfrepair',
   // Disable Reader Mode UI tour
   'browser.reader.detectedFirstArticle': true,
+
+  // Set the policy firstURL to an empty string to prevent
+  // the privacy info page to be opened on every "web-ext run".
+  // (See #1114 for rationale)
+  'datareporting.policy.firstRunURL': '',
 };
 
 const prefs = {
@@ -125,14 +126,9 @@ export function getPrefs(
 }
 
 export function coerceCLICustomPreference(
-  cliPrefs: string | Array<string>
+  cliPrefs: Array<string>
 ): FirefoxPreferences {
   const customPrefs = {};
-
-  if (!Array.isArray(cliPrefs)) {
-    cliPrefs = [cliPrefs];
-  }
-
 
   for (const pref of cliPrefs) {
     const prefsAry = pref.split('=');
